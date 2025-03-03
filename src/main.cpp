@@ -14,9 +14,12 @@ More info on https://github.com/ZioTester/ESP32-DevKitC-LAN8720
 #include <ESPAsyncWebServer.h>
 
 /*///////////////////////////////////////////////
-CONFIGURATION FOR LAN8720 CHIP
+/////////////////////////////////////////////////
+CONFIGURATION NEEDED BY LAN8720 CHIP
 DO NOT EDIT!
-///////////////////////////////////////////////*/
+///////////////////////////////////////////////
+//////////////////////////////////////////////*/
+
 #define ETH_CLOCK_IN_PIN 0
 #define ETH_MDIO_PIN 18
 #define ETH_TXD0_PIN 19
@@ -26,24 +29,115 @@ DO NOT EDIT!
 #define ETH_RXD0_PIN 25
 #define ETH_RXD1_PIN 26
 #define ETH_MODE2_PIN 27
+// In earlier versions, the power pin was 12
 #define ETH_POWER_PIN 17
 #define ETH_ADDR 1
 #define ETH_TYPE ETH_PHY_LAN8720
 #define ETH_CLK_MODE ETH_CLOCK_GPIO0_IN
 /////////////////////////////////////////////////
 
-// REST API authentication credentials
+/////////////////////////////////////////////////
+
+// Authentication credentials for REST API and web interface
 const char* AUTH_USER = "admin";
 const char* AUTH_PASS = "password";
 
-// Alarm system state and sensor configuration
+// Alarm system state
 bool alarmArmed = false;
+
+// Motion sensor pins and status
 #define NUM_SENSORS 8
-const int sensorPins[NUM_SENSORS] = {32, 33, 36, 39, 34, 35, 14, 13};
-bool sensorStatus[NUM_SENSORS];  // true = motion detected
+const int sensorPins[NUM_SENSORS] = {32, 33, 36, 39, 34, 35, 14};
+bool sensorStatus[NUM_SENSORS];
+// (Assume sensors are wired such that HIGH = motion detected, LOW = no motion)
 int sirenPin = 15;
 
+// Web server and WebSocket
 AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// HTML webpage content (served by ESP32) with embedded JavaScript for UI
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background: #f0f0f0; }
+    h1 { color: #333; }
+    .armed { color: red; font-weight: bold; }
+    .disarmed { color: green; font-weight: bold; }
+    .sensor-status { font-weight: bold; }
+    .motion { color: red; }
+    .nomotion { color: green; }
+  </style>
+</head><body>
+  <h1>ESP32 Alarm System</h1>
+  <p>System Status: <span id='armStatus' class='disarmed'>Disarmed</span></p>
+  <button id='armBtn' onclick='toggleArm()'>Arm System</button>
+  <h2>Motion Sensors</h2>
+  <ul>
+    <li>Room 1: <span id='sensor0' class='sensor-status nomotion'>No motion</span></li>
+    <li>Room 2: <span id='sensor1' class='sensor-status nomotion'>No motion</span></li>
+    <li>Room 3: <span id='sensor2' class='sensor-status nomotion'>No motion</span></li>
+  </ul>
+  <h2>Camera Feed</h2>
+  <img id='camImg' src='/api/camera?id=1' alt='Camera feed' width='320'><br>
+  <button onclick='refreshCamera()'>Refresh Camera</button>
+  <script>
+    var socket = new WebSocket('ws://' + window.location.host + '/ws');
+    socket.onmessage = function(event) {
+      var data = JSON.parse(event.data);
+      if(data.type === 'init') {
+        // Initialize UI with current status
+        document.getElementById('armStatus').textContent = data.armed ? 'Armed' : 'Disarmed';
+        document.getElementById('armStatus').className = data.armed ? 'armed' : 'disarmed';
+        document.getElementById('armBtn').textContent = data.armed ? 'Disarm System' : 'Arm System';
+        // Update all sensor statuses
+        for(var i=0; i<data.sensors.length; i++){
+          var statusElem = document.getElementById('sensor'+i);
+          if(data.sensors[i]) {
+            statusElem.textContent = 'Motion detected';
+            statusElem.className = 'sensor-status motion';
+          } else {
+            statusElem.textContent = 'No motion';
+            statusElem.className = 'sensor-status nomotion';
+          }
+        }
+      } else if(data.type === 'alarm') {
+        // Alarm armed/disarmed status changed
+        document.getElementById('armStatus').textContent = data.armed ? 'Armed' : 'Disarmed';
+        document.getElementById('armStatus').className = data.armed ? 'armed' : 'disarmed';
+        document.getElementById('armBtn').textContent = data.armed ? 'Disarm System' : 'Arm System';
+      } else if(data.type === 'sensor') {
+        // Single sensor status update
+        var i = data.id;
+        var statusElem = document.getElementById('sensor'+i);
+        if(data.status) {
+          statusElem.textContent = 'Motion detected';
+          statusElem.className = 'sensor-status motion';
+        } else {
+          statusElem.textContent = 'No motion';
+          statusElem.className = 'sensor-status nomotion';
+        }
+      }
+    };
+    socket.onopen = function(event) { console.log('WebSocket Connected'); };
+    socket.onclose = function(event) { console.log('WebSocket Closed'); };
+    function toggleArm() {
+      // Send arm/disarm command based on current status text
+      if(document.getElementById('armStatus').textContent === 'Disarmed') {
+        socket.send('arm');
+      } else {
+        socket.send('disarm');
+      }
+    }
+    function refreshCamera() {
+      // Append timestamp to force reload image (bypass cache)
+      var camImg = document.getElementById('camImg');
+      camImg.src = '/api/camera?id=1&ts=' + new Date().getTime();
+    }
+  </script>
+</body></html>
+)rawliteral";
 
 // Camera module pin definitions (for AI-Thinker ESP32-CAM module)
 #define PWDN_GPIO_NUM     32
@@ -70,6 +164,7 @@ void WiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case SYSTEM_EVENT_ETH_START:
       Serial.println("ETH Started");
+      // Set Hostname for ESP32
       ETH.setHostname("esp32-eth-alarm");
       break;
     case SYSTEM_EVENT_ETH_CONNECTED:
@@ -80,7 +175,9 @@ void WiFiEvent(WiFiEvent_t event) {
       Serial.print(ETH.macAddress());
       Serial.print(", IPv4: ");
       Serial.print(ETH.localIP());
-      if (ETH.fullDuplex()) { Serial.print(", FULL_DUPLEX"); }
+      if (ETH.fullDuplex()) {
+        Serial.print(", FULL_DUPLEX");
+      }
       Serial.print(", ");
       Serial.print(ETH.linkSpeed());
       Serial.println("Mbps");
@@ -99,56 +196,108 @@ void WiFiEvent(WiFiEvent_t event) {
   }
 }
 
+// WebSocket event handling function
+void onWebSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type,
+                      void * arg, uint8_t * data, size_t len) {
+  if(type == WS_EVT_CONNECT) {
+    Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+    // Send current alarm state and sensor status to the newly connected client
+    String initMsg = "{\"type\":\"init\",\"armed\":";
+    initMsg += (alarmArmed ? "true" : "false");
+    initMsg += ",\"sensors\":[";
+    for(int i=0; i<NUM_SENSORS; i++){
+      initMsg += (sensorStatus[i] ? "true" : "false");
+      if(i < NUM_SENSORS-1) initMsg += ",";
+    }
+    initMsg += "]}";
+    client->text(initMsg);
+  } else if(type == WS_EVT_DISCONNECT) {
+    Serial.printf("WebSocket client #%u disconnected\n", client->id());
+  } else if(type == WS_EVT_DATA) {
+    // Handle incoming WebSocket data (commands from client)
+    data[len] = 0; // null-terminate the received data
+    String cmd = (char*)data;
+    Serial.printf("Received WebSocket message: %s\n", cmd.c_str());
+    if(cmd == "arm") {
+      alarmArmed = true;
+      Serial.println("System armed via WebSocket");
+      ws.textAll("{\"type\":\"alarm\",\"armed\":true}");
+    } else if(cmd == "disarm") {
+      alarmArmed = false;
+      Serial.println("System disarmed via WebSocket");
+      ws.textAll("{\"type\":\"alarm\",\"armed\":false}");
+    }
+    // (Additional commands like requesting camera snapshot via WebSocket can be handled here)
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(ETH_POWER_PIN, OUTPUT);
-  delay(100); // Allow LAN8720 to power up
-  WiFi.onEvent(WiFiEvent);
+  // Give LAN8720 some time to power up
+  delay(100);
+  WiFi.onEvent(WiFiEvent);        // Attach event handler for Ethernet
   ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
 
-  // Initialize motion sensor pins and read initial state
-  for (int i = 0; i < NUM_SENSORS; i++) {
+  // Configure motion sensor pins as inputs
+  for(int i = 0; i < NUM_SENSORS; i++){
     pinMode(sensorPins[i], INPUT);
-    sensorStatus[i] = digitalRead(sensorPins[i]);
+    sensorStatus[i] = digitalRead(sensorPins[i]); // read initial status
   }
 
-  // Initialize siren pin
   pinMode(sirenPin, OUTPUT);
 
-  // REST API: Arm system
-  server.on("/api/arm", HTTP_POST, [](AsyncWebServerRequest * request) {
-    if (!request->authenticate(AUTH_USER, AUTH_PASS))
+  // Configure WebSocket handler and start server
+  ws.onEvent(onWebSocketEvent);
+  server.addHandler(&ws);
+
+  // Web interface page (with authentication)
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest * request){
+    if(!request->authenticate(AUTH_USER, AUTH_PASS)) {
       return request->requestAuthentication();
+    }
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // REST API: arm system
+  server.on("/api/arm", HTTP_POST, [](AsyncWebServerRequest * request){
+    if(!request->authenticate(AUTH_USER, AUTH_PASS)) {
+      return request->requestAuthentication();
+    }
     alarmArmed = true;
     Serial.println("System armed via REST API");
+    ws.textAll("{\"type\":\"alarm\",\"armed\":true}");
     request->send(200, "application/json", "{\"status\":\"armed\"}");
   });
 
-  // REST API: Disarm system
-  server.on("/api/disarm", HTTP_POST, [](AsyncWebServerRequest * request) {
-    if (!request->authenticate(AUTH_USER, AUTH_PASS))
+  // REST API: disarm system
+  server.on("/api/disarm", HTTP_POST, [](AsyncWebServerRequest * request){
+    if(!request->authenticate(AUTH_USER, AUTH_PASS)) {
       return request->requestAuthentication();
+    }
     alarmArmed = false;
     Serial.println("System disarmed via REST API");
+    ws.textAll("{\"type\":\"alarm\",\"armed\":false}");
     request->send(200, "application/json", "{\"status\":\"disarmed\"}");
   });
 
-  // REST API: Retrieve sensor statuses
-  server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest * request) {
-    if (!request->authenticate(AUTH_USER, AUTH_PASS))
+  // REST API: get sensor status
+  server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest * request){
+    if(!request->authenticate(AUTH_USER, AUTH_PASS)) {
       return request->requestAuthentication();
-    String json = "{\"sensors\":[";
-    for (int i = 0; i < NUM_SENSORS; i++) {
-      json += (sensorStatus[i] ? "true" : "false");
-      if (i < NUM_SENSORS - 1) json += ",";
     }
-    json += "],\"armed\":";
+    String json = "{\"sensors\":[";
+    for(int i = 0; i < NUM_SENSORS; i++){
+      json += (sensorStatus[i] ? "true" : "false");
+      if(i < NUM_SENSORS-1) json += ",";
+    }
+    json += "],\"armed\": ";
     json += (alarmArmed ? "true" : "false");
     json += "}";
     request->send(200, "application/json", json);
   });
 
-  // Start REST API server
+  // Start web server
   server.begin();
 }
 
@@ -166,7 +315,6 @@ void loop() {
         // Sound the siren for up to 5 minutes, but allow early exit if alarmArmed becomes false.
         unsigned long startTime = millis();
         while (millis() - startTime < 300000) { // 300000 ms = 5 minutes
-          Serial.printf("*** ALARM! SCREAMING! ***\n");
           if (!alarmArmed) {  // If alarmArmed is false, break out early.
             break;
           }
