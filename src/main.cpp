@@ -39,6 +39,7 @@ DO NOT EDIT!
 /////////////////////////////////////////////////
 
 // Authentication credentials for REST API and web interface
+// NEED TO CHANGE!
 const char *AUTH_USER = "admin";
 const char *AUTH_PASS = "password";
 
@@ -364,6 +365,16 @@ void setup()
   delay(100);
   WiFi.onEvent(WiFiEvent); // Attach event handler for Ethernet
   ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
+
+  IPAddress ipAddress;
+  IPAddress gateway;
+  IPAddress subnet;
+  IPAddress dns;
+  ipAddress.fromString("192.168.128.40");
+  gateway.fromString("192.168.128.1");
+  subnet.fromString("255.255.255.0");
+  dns.fromString("192.168.128.1");
+  ETH.config(ipAddress, gateway, subnet, dns);
 
   // Configure motion sensor pins as inputs
   for (int i = 0; i < NUM_SENSORS; i++)
